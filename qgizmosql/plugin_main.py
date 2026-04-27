@@ -37,6 +37,7 @@ from qgizmosql.toolbelt.log_handler import PlgLogger
 # conditional imports
 try:
     from qgizmosql.gui.dlg_add_gizmosql_layer import LoadGizmoSqlLayerDialog
+    from qgizmosql.gui.dlg_sql_editor import SqlEditorDialog
     from qgizmosql.provider.gizmosql_provider_metadata import GizmoSqlProviderMetadata
 
     EXTERNAL_DEPENDENCIES_AVAILABLE = True
@@ -108,6 +109,7 @@ class QgizmosqlPlugin(QgizmosqlBasePlugin):
 
         # dialogs placeholders
         self._dlg_add_layer: Optional[LoadGizmoSqlLayerDialog] = None
+        self._dlg_sql_editor: Optional[SqlEditorDialog] = None
 
     def initGui(self):
         """Set up plugin UI elements."""
@@ -145,8 +147,17 @@ class QgizmosqlPlugin(QgizmosqlBasePlugin):
         self.iface.addToolBarIcon(self.action_main)
         self.action_main.triggered.connect(self.display_gizmosql_dialog)
 
+        self.action_sql_editor = QAction(
+            QgsApplication.getThemeIcon("console/iconRunConsole.svg"),
+            self.tr("GizmoSQL SQL Editor"),
+            self.iface.mainWindow(),
+        )
+        self.iface.addToolBarIcon(self.action_sql_editor)
+        self.action_sql_editor.triggered.connect(self.display_sql_editor)
+
         # -- Menu
         self.iface.addPluginToMenu(__title__, self.action_main)
+        self.iface.addPluginToMenu(__title__, self.action_sql_editor)
         self.iface.addPluginToMenu(__title__, self.action_settings)
         self.iface.addPluginToMenu(__title__, self.action_help)
 
@@ -172,6 +183,7 @@ class QgizmosqlPlugin(QgizmosqlBasePlugin):
 
         # below come everything which depends on external dependencies
         self._dlg_add_layer = LoadGizmoSqlLayerDialog(self.iface.mainWindow())
+        self._dlg_sql_editor = SqlEditorDialog(self.iface.mainWindow())
 
         # register custom provider
         self.register_gizmosql_provider()
@@ -181,11 +193,13 @@ class QgizmosqlPlugin(QgizmosqlBasePlugin):
         """Cleans up when plugin is disabled/uninstalled."""
         # -- Clean up menu
         self.iface.removePluginMenu(__title__, self.action_main)
+        self.iface.removePluginMenu(__title__, self.action_sql_editor)
         self.iface.removePluginMenu(__title__, self.action_help)
         self.iface.removePluginMenu(__title__, self.action_settings)
 
         # -- Clean up toolbar
         self.iface.removeToolBarIcon(self.action_main)
+        self.iface.removeToolBarIcon(self.action_sql_editor)
 
         # -- Clean up preferences panel in QGIS settings
         self.iface.unregisterOptionsWidgetFactory(self.options_factory)
@@ -215,6 +229,13 @@ class QgizmosqlPlugin(QgizmosqlBasePlugin):
         if self._dlg_add_layer is None:
             self._dlg_add_layer = LoadGizmoSqlLayerDialog()
         self._dlg_add_layer.show()
+
+    def display_sql_editor(self) -> None:
+        """Display the GizmoSQL SQL editor dialog."""
+        if self._dlg_sql_editor is None:
+            self._dlg_sql_editor = SqlEditorDialog()
+        self._dlg_sql_editor.show()
+        self._dlg_sql_editor.raise_()
 
     def check_dependencies(self) -> bool:
         """Check if all dependencies are satisfied. If not, warn the user and disable plugin.
