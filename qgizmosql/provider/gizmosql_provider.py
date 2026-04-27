@@ -137,10 +137,19 @@ class GizmoSqlProvider(QgsVectorDataProvider):
         return self._is_valid
 
     def capabilities(self) -> QgsVectorDataProvider.Capabilities:
-        return (
+        base = (
             QgsVectorDataProvider.Capability.CreateSpatialIndex
             | QgsVectorDataProvider.Capability.SelectAtId
         )
+        # Write capabilities are only available for named tables, not custom SQL.
+        if self._is_valid and not self._sql:
+            base |= (
+                QgsVectorDataProvider.Capability.AddFeatures
+                | QgsVectorDataProvider.Capability.DeleteFeatures
+                | QgsVectorDataProvider.Capability.ChangeAttributeValues
+                | QgsVectorDataProvider.Capability.ChangeGeometries
+            )
+        return base
 
     # -- connection ------------------------------------------------------------
 
@@ -408,3 +417,179 @@ class GizmoSqlProvider(QgsVectorDataProvider):
             if self._fields[i].type() == field_type:
                 fields_index.append(i)
         return fields_index
+
+    # -- Write support ---------------------------------------------------------
+
+    def _qualified_table(self) -> str:
+        """Return a double-quoted schema.table identifier."""
+        schema = self._schema or "main"
+        return f'"{schema}"."{self._table}"'
+
+    @staticmethod
+    def _sql_literal(value) -> str:
+        """Convert a Python value to a safe SQL literal (no driver-side params)."""
+        if value is None:
+            return "NULL"
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, (int, float)):
+            return str(value)
+        # String / date / datetime — escape single quotes by doubling them.
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _pk_column_name(self) -> Optional[str]:
+        """Return the primary-key column name, or None if none detected."""
+        pk_idx = self.primary_key()
+        if pk_idx == -1:
+            return None
+        return self.fields().field(pk_idx).name()
+
+    def addFeatures(
+        self, flist: list, flags=QgsVectorDataProvider.Flags()
+    ) -> tuple[bool, list]:
+        if not self._is_valid or self._sql:
+            return False, []
+
+        tbl = self._qualified_table()
+        flds = self.fields()
+        added = []
+
+        try:
+            with self._con.cursor() as cur:
+                for feat in flist:
+                    col_parts = []
+                    val_parts = []
+
+                    # Non-geometry attributes
+                    for i in range(flds.count()):
+                        col_parts.append(f'"{flds.field(i).name()}"')
+                        val_parts.append(self._sql_literal(feat.attribute(i)))
+
+                    # Geometry
+                    if self._column_geom and not feat.geometry().isNull():
+                        wkt = feat.geometry().asWkt()
+                        col_parts.append(f'"{self._column_geom}"')
+                        val_parts.append(f"ST_GeomFromText('{wkt}')")
+
+                    sql = (
+                        f"INSERT INTO {tbl} ({', '.join(col_parts)}) "
+                        f"VALUES ({', '.join(val_parts)})"
+                    )
+                    cur.execute(sql)
+                    added.append(feat)
+
+            self._feature_count = None
+            self._extent = None
+            return True, added
+        except Exception as exc:
+            PlgLogger.log(
+                message=f"addFeatures failed: {exc}",
+                log_level=Qgis.MessageLevel.Critical,
+                push=True,
+            )
+            return False, []
+
+    def deleteFeatures(self, ids: list) -> bool:
+        if not self._is_valid or self._sql or not ids:
+            return False
+
+        pk = self._pk_column_name()
+        if pk is None:
+            PlgLogger.log(
+                message="deleteFeatures: table has no primary key — cannot delete.",
+                log_level=Qgis.MessageLevel.Warning,
+                push=True,
+            )
+            return False
+
+        tbl = self._qualified_table()
+        id_list = ", ".join(str(i) for i in ids)
+        sql = f'DELETE FROM {tbl} WHERE "{pk}" IN ({id_list})'
+
+        try:
+            with self._con.cursor() as cur:
+                cur.execute(sql)
+            self._feature_count = None
+            self._extent = None
+            return True
+        except Exception as exc:
+            PlgLogger.log(
+                message=f"deleteFeatures failed: {exc}",
+                log_level=Qgis.MessageLevel.Critical,
+                push=True,
+            )
+            return False
+
+    def changeAttributeValues(self, attr_map: dict) -> bool:
+        """attr_map: {fid: {field_index: new_value, ...}, ...}"""
+        if not self._is_valid or self._sql or not attr_map:
+            return False
+
+        pk = self._pk_column_name()
+        if pk is None:
+            PlgLogger.log(
+                message="changeAttributeValues: table has no primary key.",
+                log_level=Qgis.MessageLevel.Warning,
+                push=True,
+            )
+            return False
+
+        tbl = self._qualified_table()
+        flds = self.fields()
+
+        try:
+            with self._con.cursor() as cur:
+                for fid, field_map in attr_map.items():
+                    set_clauses = [
+                        f'"{flds.field(fidx).name()}" = {self._sql_literal(val)}'
+                        for fidx, val in field_map.items()
+                    ]
+                    sql = (
+                        f"UPDATE {tbl} SET {', '.join(set_clauses)} "
+                        f'WHERE "{pk}" = {fid}'
+                    )
+                    cur.execute(sql)
+            return True
+        except Exception as exc:
+            PlgLogger.log(
+                message=f"changeAttributeValues failed: {exc}",
+                log_level=Qgis.MessageLevel.Critical,
+                push=True,
+            )
+            return False
+
+    def changeGeometryValues(self, geom_map: dict) -> bool:
+        """geom_map: {fid: QgsGeometry, ...}"""
+        if not self._is_valid or self._sql or not self._column_geom or not geom_map:
+            return False
+
+        pk = self._pk_column_name()
+        if pk is None:
+            PlgLogger.log(
+                message="changeGeometryValues: table has no primary key.",
+                log_level=Qgis.MessageLevel.Warning,
+                push=True,
+            )
+            return False
+
+        tbl = self._qualified_table()
+        geom_col = f'"{self._column_geom}"'
+
+        try:
+            with self._con.cursor() as cur:
+                for fid, geom in geom_map.items():
+                    wkt = geom.asWkt()
+                    sql = (
+                        f"UPDATE {tbl} SET {geom_col} = ST_GeomFromText('{wkt}') "
+                        f'WHERE "{pk}" = {fid}'
+                    )
+                    cur.execute(sql)
+            self._extent = None
+            return True
+        except Exception as exc:
+            PlgLogger.log(
+                message=f"changeGeometryValues failed: {exc}",
+                log_level=Qgis.MessageLevel.Critical,
+                push=True,
+            )
+            return False
