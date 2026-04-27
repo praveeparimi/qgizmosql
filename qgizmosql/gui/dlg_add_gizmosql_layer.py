@@ -12,6 +12,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsProject,
     QgsProviderRegistry,
+    QgsSettings,
     QgsVectorLayer,
 )
 from qgis.gui import QgsAuthConfigSelect, QgsProjectionSelectionWidget
@@ -24,8 +25,10 @@ from qgis.PyQt.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
@@ -45,22 +48,46 @@ from qgizmosql.toolbelt.log_handler import PlgLogger
 class LoadGizmoSqlLayerDialog(QDialog):
     """Connect to a GizmoSQL server and add one of its tables as a QGIS layer."""
 
+    # QgsSettings key prefix for saved connections
+    _SETTINGS_KEY = "qgizmosql/connections"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add GizmoSQL layer")
         self.setWindowIcon(
             QIcon(str(DIR_PLUGIN_ROOT.joinpath("resources/images/logo_gizmosql.png")))
         )
-        self.resize(560, 560)
+        self.resize(560, 600)
 
         self._wrapper: Optional[GizmoSqlTools] = None
         self._build_ui()
         self._wire_up()
+        self._populate_saved_connections()
 
     # -- UI construction -------------------------------------------------------
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+
+        # -- Saved connections group ------------------------------------------
+        saved_box = QGroupBox("Saved connections")
+        saved_row = QHBoxLayout(saved_box)
+
+        self._saved_combo = QComboBox()
+        self._saved_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._saved_combo.setMinimumWidth(200)
+        saved_row.addWidget(self._saved_combo, 1)
+
+        self._load_conn_btn = QPushButton("Load")
+        self._save_conn_btn = QPushButton("Save")
+        self._delete_conn_btn = QPushButton("Delete")
+        saved_row.addWidget(self._load_conn_btn)
+        saved_row.addWidget(self._save_conn_btn)
+        saved_row.addWidget(self._delete_conn_btn)
+
+        root.addWidget(saved_box)
 
         # -- Connection group --------------------------------------------------
         conn_box = QGroupBox("Connection")
@@ -159,6 +186,97 @@ class LoadGizmoSqlLayerDialog(QDialog):
         self._sql_edit.textChanged.connect(self._refresh_add_enabled)
         self._add_layer_btn.clicked.connect(self._on_add_layer_clicked)
         self._buttons.rejected.connect(self.reject)
+        self._load_conn_btn.clicked.connect(self._on_load_connection)
+        self._save_conn_btn.clicked.connect(self._on_save_connection)
+        self._delete_conn_btn.clicked.connect(self._on_delete_connection)
+
+    # -- Saved connection helpers ----------------------------------------------
+
+    def _qgs_settings(self) -> QgsSettings:
+        return QgsSettings()
+
+    def _saved_connection_names(self) -> list:
+        s = self._qgs_settings()
+        s.beginGroup(self._SETTINGS_KEY)
+        names = s.childGroups()
+        s.endGroup()
+        return sorted(names)
+
+    def _populate_saved_connections(self) -> None:
+        self._saved_combo.clear()
+        self._saved_combo.addItem("")
+        for name in self._saved_connection_names():
+            self._saved_combo.addItem(name)
+
+    def _on_load_connection(self) -> None:
+        name = self._saved_combo.currentText().strip()
+        if not name:
+            self._status_label.setStyleSheet("color: #a00;")
+            self._status_label.setText("Select a saved connection to load.")
+            return
+        s = self._qgs_settings()
+        s.beginGroup(f"{self._SETTINGS_KEY}/{name}")
+        self._host_edit.setText(s.value("host", "localhost"))
+        self._port_spin.setValue(int(s.value("port", 31337)))
+        self._use_tls_cb.setChecked(s.value("use_tls", True, type=bool))
+        self._tls_skip_cb.setChecked(s.value("tls_skip_verify", False, type=bool))
+        auth_type = s.value("auth_type", "password")
+        idx = self._auth_type_combo.findData(auth_type)
+        if idx >= 0:
+            self._auth_type_combo.setCurrentIndex(idx)
+        authcfg = s.value("authcfg", "")
+        if authcfg:
+            self._authcfg_select.setConfigId(authcfg)
+        s.endGroup()
+        self._status_label.setStyleSheet("color: #060;")
+        self._status_label.setText(f"Loaded connection '{name}'.")
+
+    def _on_save_connection(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "Save connection",
+            "Connection name:",
+            text=self._saved_combo.currentText().strip() or self._host_edit.text().strip(),
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        conn = self._current_conn_config()
+        s = self._qgs_settings()
+        s.beginGroup(f"{self._SETTINGS_KEY}/{name}")
+        s.setValue("host", conn.host)
+        s.setValue("port", conn.port)
+        s.setValue("use_tls", conn.use_tls)
+        s.setValue("tls_skip_verify", conn.tls_skip_verify)
+        s.setValue("auth_type", conn.auth_type)
+        s.setValue("authcfg", conn.authcfg or "")
+        s.endGroup()
+        self._populate_saved_connections()
+        idx = self._saved_combo.findText(name)
+        if idx >= 0:
+            self._saved_combo.setCurrentIndex(idx)
+        self._status_label.setStyleSheet("color: #060;")
+        self._status_label.setText(f"Connection '{name}' saved.")
+
+    def _on_delete_connection(self) -> None:
+        name = self._saved_combo.currentText().strip()
+        if not name:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete connection",
+            f"Delete saved connection '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        s = self._qgs_settings()
+        s.beginGroup(self._SETTINGS_KEY)
+        s.remove(name)
+        s.endGroup()
+        self._populate_saved_connections()
+        self._status_label.setStyleSheet("color: #060;")
+        self._status_label.setText(f"Connection '{name}' deleted.")
 
     # -- signal handlers -------------------------------------------------------
 
